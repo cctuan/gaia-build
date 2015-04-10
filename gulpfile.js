@@ -12,9 +12,173 @@ var through = require('through2');
 var path = require('path');
 var runSeq = require('gulp-run-sequence');
 var merge = require('merge-stream');
-
+var dom  = require('gulp-dom');
 var appList = argv.app ? [argv.app] : fs.readdirSync('apps');
 var ignores = ['!apps/**/+(build|test)/**'];
+var stream = require('stream');
+var gutil = require('gulp-util');
+var fork = require('child_process').fork;
+var test = require('./builder');
+var lazypipe = require('lazypipe');
+// the edges of each node should be a string or it cannot be successfully built
+var dag = require('breeze-dag');
+
+var configResult = {};
+
+var Task = function(target, data) {
+  this.parent = [];
+  this.data = data;
+  this.target = target;
+};
+
+var Builder = function(config, endCb) {
+  this.workers = [];
+  this.endCb = endCb;
+  this.config = config;
+  this.taskTree = {};
+  this.runTasks = [];
+  this.edges = [];
+  this.start();
+};
+
+// if deps is newer than target, then execute it
+Builder.prototype = {
+  WORKER_NUM: 4, // should detect cpu number
+  start: function() {
+    this.endCb();
+    this.initTaskTree();
+    //this.initWorkers();
+    this.runTasks.forEach(this.scanEdges, this);
+    this.exec();
+  },
+  initWorkers: function() {
+    for (var i = 0; i < this.WORKER_NUM; i++) {
+      var forker = fork(__dirname + '/builder.js');
+      this.workers.push({
+        runner: forker,
+        status: false,
+        cmd: null
+      });
+      forker.on('message', this.onMessage.bind(this));
+    }
+  },
+
+  initTaskTree: function() {
+    var initData = this.config['start'];
+    var initTask = new Task(null, initData);
+    this.scanChildren(initTask);
+  },
+
+  scanChildren: function(task) {
+    //console.log(task);
+    if (task.data.deps && task.data.deps.length == 0) {
+      if (this.shouldRunCheck(task)) {
+        this.runTasks.push(task);
+      }
+      return;
+    }
+    for (var i = 0; i < task.data.deps.length; i++) {
+      var dep = task.data.deps[i];
+      if (this.config[dep]) {
+        var subTask = new Task(dep, this.config[dep]);
+        subTask.parent.push(task);
+        this.scanChildren(subTask);
+      }
+    }
+  },
+
+  shouldRunCheck: function(task) {
+    if (!task.data.source) {
+      return false;
+    }
+    var shouldRun = this.compareParentTask(task, null);
+    console.log(shouldRun);
+    return shouldRun;
+
+  },
+
+  compareParentTask: function(task, rootTask) {
+    if (task.target === 'start' || !task.parent || task.parent.length === 0) {
+      return null;
+    }
+
+    if (!rootTask) {
+      rootTask = task;
+    }
+
+    for (var index in task.parent) {
+      var parentTask = task.parent[index];
+
+      if (this.compareModTime(rootTask, parentTask) ||
+          this.compareParentTask(parentTask, rootTask)) {
+        return true;
+      }
+    }
+    return false;
+  },
+
+  // true, if sourceTask is newer than targetTask or targetTask is null
+  compareModTime: function(sourceTask, targetTask) {
+    if (targetTask.target === null || targetTask.target === 'start') {
+      return false;
+    }
+
+    if (targetTask.data.wr === 'w' && !fs.existsSync(targetTask.target)) {
+      console.log(targetTask.target);
+      console.log(fs.existsSync(targetTask.target));
+      return true;
+    }
+
+    var source = fs.statSync(sourceTask.target);
+    var target = fs.statSync(targetTask.target);
+    if (source.mtime > target.mtime) {
+      console.log(target);
+      console.log(source);
+    }
+    return source.ctime > target.ctime;
+  },
+
+  scanEdges: function(task) {
+    if (task.target === null) {
+      return;
+    }
+    for (var i = 0; i < task.parent.length; i++) {
+      var parentTask = task.parent[i];
+      if (parentTask.target) {
+        this.edges.push([task.target, parentTask.target]);
+      }
+      this.scanEdges(parentTask);
+    }
+  },
+
+  exec: function() {
+    var self = this;
+    //console.log(this.edges);
+    dag(this.edges, 4, function(e, next) {
+      var task = self.config[e];
+      test.execute(task, next);
+    }, function(err) {
+      //console.log(err);
+    });
+
+  },
+
+  onMessage: function(msg) {
+    switch(msg.type) {
+
+    }
+  }
+};
+
+function string_src(filename, string) {
+  var src = stream.Readable({ objectMode: true })
+  src._read = function () {
+    this.push(new gutil.File({ cwd: "", base: "", path: filename,
+      contents: new Buffer(string) }))
+    this.push(null)
+  }
+  return src
+}
 
 function mergeAppPath(newFolderPath, appPath) {
   var currentPath = path.resolve('./');
@@ -28,91 +192,178 @@ gulp.task('clean', function() {
     .pipe(rimraf('build_stage'));
 });
 
-
-var make = new Make.make();
-
-gulp.task('cpapp', function(done) {
+gulp.task('configure', function() {
+  // start task from start and end task with null deps
+  configResult['start'] = {
+    deps: [path.resolve('profile')],
+    cmd: null,
+    wr: null,
+    source: false
+  };
   var tasks = appList.map(function(app) {
-    return gulp.src('apps/' + app)
-      .pipe(through.obj(
-        function(file, env, cb) {
-          var targetPath = path.resolve('build_stage/' + app);
-          var sourcePath = path.resolve('apps/' + app);
-          make.insertTask(false, targetPath, [sourcePath],
-            [
-             '@mkdir -p ' + path.resolve('build_stage/' + app),
-             '@cp -r ' + sourcePath + ' ' + path.resolve('build_stage')
-            ]
-          );
-          cb();
+    if (!configResult[path.resolve('profile')]) {
+      configResult[path.resolve('profile')] = {
+        deps: [path.resolve('profile/' + app)],
+        cmd: null,
+        wr: null,
+        source: false
+      };
+    } else {
+      configResult[path.resolve('profile')]
+        .deps.push(path.resolve('profile/' + app));
+    }
+
+    if (!configResult[path.resolve('profile/' + app)]) {
+      configResult[path.resolve('profile/' + app)] = {
+        deps: [path.resolve('build_stage/' + app)],
+        cmd: {
+          type: 'zip',
+          content: path.resolve('build_stage/' + app) + ' ' +
+            path.resolve('profile/' + app)
         },
-        function(cb) {
-          cb();
+        wr: 'w',
+        source: false
+      };
+    }
+
+    configResult[path.resolve('build_stage/' + app)] = {
+      deps: [
+        path.resolve('build_stage/' + app + '/shared'), 
+        path.resolve('build_stage/' + app + '/style'),
+        path.resolve('build_stage/' + app + '/js'),
+        path.resolve('build_stage/' + app + '/index.html')
+      ],
+      cmd: null,
+      wr: 'w',
+      source: false
+    };
+
+    configResult[path.resolve('build_stage/' + app + '/style')] = {
+      deps: [path.resolve('apps/' + app + '/style')],
+      cmd: {
+        type: 'cp',
+        content: path.resolve('apps/' + app + '/style') + ' ' +
+          path.resolve('build_stage/' + app)
+      },
+      wr: 'w',
+      source: false
+
+    };
+
+    configResult[path.resolve('apps/' + app + '/style')] = {
+      deps: [],
+      cmd: null,
+      wr: 'r',
+      source: true
+    };
+
+    configResult[path.resolve('build_stage/' + app + '/js')] = {
+      deps: [path.resolve('apps/' + app + '/js')],
+      cmd: {
+        type: 'cp',
+        content: path.resolve('apps/' + app + '/js') + ' ' +
+          path.resolve('build_stage/' + app)
+      },
+      wr: 'w',
+      source: false
+    };
+
+    configResult[path.resolve('apps/' + app + '/js')] = {
+      deps: [],
+      cmd: null,
+      wr: 'r',
+      source: true
+    };
+
+    configResult[path.resolve('build_stage/' + app + '/index.html')] = {
+      deps: [path.resolve('apps/' + app + '/index.html')],
+      cmd: {
+        type: 'cp',
+        content: path.resolve('apps/' + app + '/index.html') + ' ' +
+          path.resolve('build_stage/' + app)
+      },
+      wr: 'w',
+      source: false
+    };
+
+    configResult[path.resolve('apps/' + app + '/index.html')] = {
+      deps: [],
+      cmd: null,
+      wr: 'r',
+      source: true
+    };
+
+    return gulp.src(['apps/' + app + '/**/*.html'].concat(ignores))
+      .pipe(dom(function() {
+        var allScripts = this.querySelectorAll('script');
+        var sharedScripts = [];
+        // this.querySelectorAll is not an Array type.
+        for (var i = 0; i < allScripts.length; i++) {
+          if (/^\/shared/.test(allScripts[i].src)) {
+
+            sharedScripts.push(allScripts[i].src);
+
+            configResult[path.resolve('build_stage/' + app + '/' +
+              allScripts[i].src)] = {
+                deps: [path.resolve('./' + allScripts[i].src)],
+                cmd: {
+                  type: 'cp',
+                  content: path.resolve('./' + allScripts[i].src) + ' ' +
+                    path.resolve('build_stage/' + app + '/shared/js')
+                },
+                wr: 'w',
+                source: false
+              };
+            configResult[path.resolve('./' + allScripts[i].src)] = {
+              deps: [],
+              cmd: null,
+              wr: null,
+              source: true
+            };
+            if (!configResult[path.resolve('build_stage/' + app + '/shared')]) {
+              configResult[path.resolve('build_stage/' + app + '/shared')] = {
+                deps: [path.resolve('build_stage/' + app + '/' +
+                  allScripts[i].src)],
+                cmd: null,
+                wr: null,
+                source: false
+              };
+            } else {
+              configResult[path.resolve('build_stage/' + app + '/shared')].deps
+                .push(path.resolve('build_stage/' + app + '/' +
+                  allScripts[i].src));
+            }
+          }
         }
-      ));
-        
-  });
-  return merge(tasks).pipe(through.obj(function(file, env, cb) {
-    cb();
-    done();
-  }));
-});
-
-gulp.task('config-apps', function(done) {
-  // scan HTML ? 
-  var appFolderName = [];
-  var commands = [];
-  var tasks = appList.map(function(app) {
-    appFolderName.push(path.resolve('profile/' + app));
-
-    make.insertTask(false, path.resolve('profile/' + app + '/application.zip'),
-      [path.resolve('build_stage/' + app + '/js')],
-      ['@mkdir -p ' + path.resolve('profile/' + app),
-       '@zip -r ' +
-        path.resolve('profile/' + app + '/application.zip') + ' ' +
-        'build_stage/' + app + ' -x "*.png"']);
-
-    make.insertTask(false, path.resolve('profile/' + app),
-      [path.resolve('profile/' + app + '/application.zip')],
-      []);
-
-    var jsFileList = [];
-    var jsStream = gulp.src(['apps/' + app + '/**/*.js'].concat(ignores))
+        return this;
+      }))
       .pipe(through.obj(function(file, env, cb) {
-        var targetPath = mergeAppPath('build_stage', file.path);
-        var folderName = path.dirname(targetPath);
-        var fileName = path.basename(targetPath);
-        var minifiedPath = folderName + '/min_' + fileName;
-        jsFileList.push(minifiedPath);
-        make.insertTask(false, minifiedPath,
-          [path.resolve('build_stage/' + app)],
-          ['@node jsmin ' + targetPath +' -o ' + minifiedPath]);
+        //console.log(file.path);
         cb();
-        }, function(cb) {
-          make.insertTask(false, path.resolve('build_stage/' + app + '/js'),
-            jsFileList, []);
-          cb();
-        })
-      );
-    return merge(jsStream);
+      }));
   });
 
-  
-  make.insertTask(false, 'profile', appFolderName,
-    []);
-  return merge(tasks).pipe(through.obj(function(file, env, cb) {
-    cb();
-    done();
-  }));
+  return merge(tasks);
 });
 
-gulp.task('writeMakefile', function() {
-  return gulp.src('Makefile').pipe(through.obj(function(file, env, cb) {
-    make.writeMk('Makefile');
-    cb();
-  }));
+gulp.task('write-config', function() {
+  return string_src('config_all.json',
+    JSON.stringify(configResult, null ,2))
+    .pipe(gulp.dest('./'))
 });
+
+gulp.task('build', function() {
+  return gulp.src('config_all.json')
+    .pipe(through.obj(function(file, enc, cb) {
+      var allConfig = JSON.parse(file.contents.toString());
+      new Builder(allConfig, cb);
+    }));
+});
+
 
 gulp.task('default', function(cb) {
-  runSeq('cpapp', 'config-apps', 'writeMakefile', cb);
+  runSeq('configure', 'write-config', 'build', cb);
 });
+
+
+
